@@ -300,7 +300,7 @@ func TestServerBehaviour(t *testing.T) {
 			Name:           `valid tls config yml and tls client with RequireAnyClientCert`,
 			YAMLConfigPath: "testdata/tls_config_noAuth.requireanyclientcert.good.yml",
 			UseTLSClient:   true,
-			ExpectedError:  ErrorMap["Bad certificate"],
+			ExpectedError:  ErrorMap["Unauthorized"],
 		},
 		{
 			Name:           `valid headers config`,
@@ -332,7 +332,7 @@ func TestServerBehaviour(t *testing.T) {
 			Name:           `valid tls config yml and tls client with RequireAndVerifyClientCert`,
 			YAMLConfigPath: "testdata/tls_config_noAuth.requireandverifyclientcert.good.yml",
 			UseTLSClient:   true,
-			ExpectedError:  ErrorMap["Bad certificate"],
+			ExpectedError:  ErrorMap["Unauthorized"],
 		},
 		{
 			Name:              `valid tls config yml and tls client with RequireAndVerifyClientCert (present certificate)`,
@@ -346,7 +346,7 @@ func TestServerBehaviour(t *testing.T) {
 			YAMLConfigPath:    "testdata/tls_config_noAuth.requireandverifyclientcert.good.yml",
 			UseTLSClient:      true,
 			ClientCertificate: "client2_selfsigned",
-			ExpectedError:     ErrorMap["Bad certificate"],
+			ExpectedError:     ErrorMap["Unauthorized"],
 		},
 		{
 			Name:              `valid tls config yml and tls client with VerifyPeerCertificate (present good SAN DNS entry)`,

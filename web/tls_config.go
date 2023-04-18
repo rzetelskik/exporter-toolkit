@@ -37,9 +37,10 @@ var (
 )
 
 type Config struct {
-	TLSConfig  TLSConfig                     `yaml:"tls_server_config"`
-	HTTPConfig HTTPConfig                    `yaml:"http_server_config"`
-	Users      map[string]config_util.Secret `yaml:"basic_auth_users"`
+	TLSConfig                  TLSConfig                     `yaml:"tls_server_config"`
+	HTTPConfig                 HTTPConfig                    `yaml:"http_server_config"`
+	Users                      map[string]config_util.Secret `yaml:"basic_auth_users"`
+	AuthorizationExcludedPaths []string                      `yaml:"authorization_excluded_paths"`
 }
 
 type TLSConfig struct {
@@ -132,6 +133,39 @@ func getTLSConfig(configPath string) (*tls.Config, error) {
 	return ConfigToTLSConfig(&c.TLSConfig)
 }
 
+func GetClientCAs(clientCAsPath string) (*x509.CertPool, error) {
+	clientCAPool := x509.NewCertPool()
+	if clientCAsPath == "" {
+		return clientCAPool, nil
+	}
+
+	clientCAFile, err := os.ReadFile(clientCAsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCAPool.AppendCertsFromPEM(clientCAFile)
+
+	return clientCAPool, nil
+}
+
+func ParseClientAuth(s string) (tls.ClientAuthType, error) {
+	switch s {
+	case "RequestClientCert":
+		return tls.RequestClientCert, nil
+	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
+		return tls.RequireAnyClientCert, nil
+	case "VerifyClientCertIfGiven":
+		return tls.VerifyClientCertIfGiven, nil
+	case "RequireAndVerifyClientCert":
+		return tls.RequireAndVerifyClientCert, nil
+	case "", "NoClientCert":
+		return tls.NoClientCert, nil
+	default:
+		return tls.ClientAuthType(0), errors.New("Invalid ClientAuth: " + s)
+	}
+}
+
 // ConfigToTLSConfig generates the golang tls.Config from the TLSConfig struct.
 func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
 	if c.TLSCertPath == "" && c.TLSKeyPath == "" && c.ClientAuth == "" && c.ClientCAs == "" {
@@ -185,38 +219,29 @@ func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
 		cfg.CurvePreferences = cp
 	}
 
-	if c.ClientCAs != "" {
-		clientCAPool := x509.NewCertPool()
-		clientCAFile, err := os.ReadFile(c.ClientCAs)
-		if err != nil {
-			return nil, err
-		}
-		clientCAPool.AppendCertsFromPEM(clientCAFile)
-		cfg.ClientCAs = clientCAPool
+	clientCAs, err := GetClientCAs(c.ClientCAs)
+	if err != nil {
+		return nil, err
 	}
+	cfg.ClientCAs = clientCAs
 
 	if c.ClientAllowedSans != nil {
 		// verify that the client cert contains an allowed SAN
 		cfg.VerifyPeerCertificate = c.VerifyPeerCertificate
 	}
 
-	switch c.ClientAuth {
-	case "RequestClientCert":
-		cfg.ClientAuth = tls.RequestClientCert
-	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
-		cfg.ClientAuth = tls.RequireAnyClientCert
-	case "VerifyClientCertIfGiven":
-		cfg.ClientAuth = tls.VerifyClientCertIfGiven
-	case "RequireAndVerifyClientCert":
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
-	case "", "NoClientCert":
-		cfg.ClientAuth = tls.NoClientCert
-	default:
-		return nil, errors.New("Invalid ClientAuth: " + c.ClientAuth)
+	clientAuth, err := ParseClientAuth(c.ClientAuth)
+	if err != nil {
+		return nil, err
 	}
 
-	if c.ClientCAs != "" && cfg.ClientAuth == tls.NoClientCert {
+	if c.ClientCAs != "" && clientAuth == tls.NoClientCert {
 		return nil, errors.New("Client CA's have been configured without a Client Auth Policy")
+	}
+
+	if clientAuth > tls.RequestClientCert {
+		// TODO: comment
+		cfg.ClientAuth = tls.RequestClientCert
 	}
 
 	return cfg, nil
@@ -301,21 +326,27 @@ func Serve(l net.Listener, server *http.Server, flags *FlagConfig, logger log.Lo
 	}
 
 	config, err := ConfigToTLSConfig(&c.TLSConfig)
-	switch err {
-	case nil:
-		if !c.HTTPConfig.HTTP2 {
-			server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	if err != nil {
+		if err == errNoTLSConfig {
+			// No TLS config, back to plain HTTP.
+			level.Info(logger).Log("msg", "TLS is disabled.", "http2", false, "address", l.Addr().String())
+			return server.Serve(l)
 		}
-		// Valid TLS config.
-		level.Info(logger).Log("msg", "TLS is enabled.", "http2", c.HTTPConfig.HTTP2, "address", l.Addr().String())
-	case errNoTLSConfig:
-		// No TLS config, back to plain HTTP.
-		level.Info(logger).Log("msg", "TLS is disabled.", "http2", false, "address", l.Addr().String())
-		return server.Serve(l)
-	default:
+
 		// Invalid TLS config.
 		return err
 	}
+
+	if !c.HTTPConfig.HTTP2 {
+		server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	}
+	// Valid TLS config.
+	level.Info(logger).Log("msg", "TLS is enabled.", "http2", c.HTTPConfig.HTTP2, "address", l.Addr().String())
+
+	tlsAuthorizationOptions := TLSAuthorizationOptions{
+		webConfigPath: tlsConfigPath,
+	}
+	server.Handler = WithTLSAuthorization(server.Handler, tlsAuthorizationOptions, logger)
 
 	server.TLSConfig = config
 

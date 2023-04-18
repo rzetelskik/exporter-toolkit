@@ -107,6 +107,10 @@ http_server_config:
 # required. Passwords are hashed with bcrypt.
 basic_auth_users:
   [ <string>: <secret> ... ]
+  
+# A list of HTTP paths to skip during authorization.
+authorization_excluded_paths:
+[ - <string> ]
 ```
 
 [A sample configuration file](web-config.yml) is provided.
