@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/go-kit/log"
@@ -37,9 +38,10 @@ var (
 )
 
 type Config struct {
-	TLSConfig  TLSConfig                     `yaml:"tls_server_config"`
-	HTTPConfig HTTPConfig                    `yaml:"http_server_config"`
-	Users      map[string]config_util.Secret `yaml:"basic_auth_users"`
+	TLSConfig                  TLSConfig                     `yaml:"tls_server_config"`
+	HTTPConfig                 HTTPConfig                    `yaml:"http_server_config"`
+	Users                      map[string]config_util.Secret `yaml:"basic_auth_users"`
+	AuthorizationExcludedPaths []string                      `yaml:"authorization_excluded_paths"`
 }
 
 type TLSConfig struct {
@@ -132,6 +134,27 @@ func getTLSConfig(configPath string) (*tls.Config, error) {
 	return ConfigToTLSConfig(&c.TLSConfig)
 }
 
+// ---
+
+func ParseClientAuth(s string) (tls.ClientAuthType, error) {
+	switch s {
+	case "RequestClientCert":
+		return tls.RequestClientCert, nil
+	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
+		return tls.RequireAnyClientCert, nil
+	case "VerifyClientCertIfGiven":
+		return tls.VerifyClientCertIfGiven, nil
+	case "RequireAndVerifyClientCert":
+		return tls.RequireAndVerifyClientCert, nil
+	case "", "NoClientCert":
+		return tls.NoClientCert, nil
+	default:
+		return tls.ClientAuthType(0), errors.New("Invalid ClientAuth: " + s)
+	}
+}
+
+// ---
+
 // ConfigToTLSConfig generates the golang tls.Config from the TLSConfig struct.
 func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
 	if c.TLSCertPath == "" && c.TLSKeyPath == "" && c.ClientAuth == "" && c.ClientCAs == "" {
@@ -200,23 +223,18 @@ func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
 		cfg.VerifyPeerCertificate = c.VerifyPeerCertificate
 	}
 
-	switch c.ClientAuth {
-	case "RequestClientCert":
-		cfg.ClientAuth = tls.RequestClientCert
-	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
-		cfg.ClientAuth = tls.RequireAnyClientCert
-	case "VerifyClientCertIfGiven":
-		cfg.ClientAuth = tls.VerifyClientCertIfGiven
-	case "RequireAndVerifyClientCert":
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
-	case "", "NoClientCert":
-		cfg.ClientAuth = tls.NoClientCert
-	default:
-		return nil, errors.New("Invalid ClientAuth: " + c.ClientAuth)
+	clientAuth, err := ParseClientAuth(c.ClientAuth)
+	if err != nil {
+		return nil, err
 	}
 
-	if c.ClientCAs != "" && cfg.ClientAuth == tls.NoClientCert {
+	if c.ClientCAs != "" && clientAuth == tls.NoClientCert {
 		return nil, errors.New("Client CA's have been configured without a Client Auth Policy")
+	}
+
+	if c.ClientCAs != "" {
+		// TODO: comment
+		cfg.ClientAuth = tls.RequestClientCert
 	}
 
 	return cfg, nil
@@ -234,6 +252,191 @@ func ServeMultiple(listeners []net.Listener, server *http.Server, flags *FlagCon
 	}
 	return errs.Wait()
 }
+
+// ---
+
+type unionAuthorizer []Authorizer
+
+func NewUnionAuthorizer(authorizers ...Authorizer) Authorizer {
+	return unionAuthorizer(authorizers)
+}
+
+func (ua unionAuthorizer) Authorize(r *http.Request) (Decision, error) {
+	var errs []error
+
+	for _, a := range ua {
+		decision, err := a.Authorize(r)
+
+		if err != nil {
+			errs = append(errs, err)
+		}
+
+		switch decision {
+		case DecisionAllow, DecisionDeny:
+			return decision, err
+		case DecisionNoDecision:
+			continue
+		}
+	}
+
+	// TODO: merge errors
+	return DecisionNoDecision, nil
+}
+
+type TLSAuthorizationOptions struct {
+	ClientAuth    tls.ClientAuthType
+	ExcludedPaths []string
+	ClientCAs     *x509.CertPool
+}
+
+func (o *TLSAuthorizationOptions) ToAuthorizer() (Authorizer, error) {
+	var authorizers []Authorizer
+
+	if len(o.ExcludedPaths) > 0 {
+		a, err := NewPathAuthorizer(o.ExcludedPaths)
+		if err != nil {
+			return nil, err
+		}
+
+		authorizers = append(authorizers, a)
+	}
+
+	clientCertAuthorizer, err := NewClientCertAuthorizer(o.ClientAuth, o.ClientCAs)
+	if err != nil {
+		return nil, err
+	}
+	authorizers = append(authorizers, clientCertAuthorizer)
+
+	alwaysDenyAuthorizer, err := NewAlwaysDenyAuthorizer()
+	if err != nil {
+		return nil, err
+	}
+	authorizers = append(authorizers, alwaysDenyAuthorizer)
+
+	return NewUnionAuthorizer(authorizers...), nil
+}
+
+type Decision int
+
+const (
+	DecisionDeny = iota
+	DecisionNoDecision
+	DecisionAllow
+)
+
+type Authorizer interface {
+	Authorize(*http.Request) (Decision, error)
+}
+
+type AuthorizerFunc func(*http.Request) (Decision, error)
+
+func (f AuthorizerFunc) Authorize(r *http.Request) (Decision, error) {
+	return f(r)
+}
+
+func WithAuthorization(handler http.Handler, authorizer Authorizer) http.Handler {
+	if authorizer == nil {
+		return handler
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorized, err := authorizer.Authorize(r)
+		if authorized == DecisionAllow {
+			// TODO: annotate, log?
+			handler.ServeHTTP(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			// TODO: handle error
+			return
+		}
+
+		// TODO: decision no decision?
+		// TODO: log ?
+		// TODO: check what to write
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	})
+}
+
+func NewAlwaysDenyAuthorizer() (Authorizer, error) {
+	return AuthorizerFunc(func(_ *http.Request) (Decision, error) {
+		return DecisionDeny, nil
+	}), nil
+}
+
+type clientCertAuthorizer struct {
+	ClientAuth tls.ClientAuthType
+	ClientCAs  *x509.CertPool
+}
+
+func isClientCertRequired(c tls.ClientAuthType) bool {
+	switch c {
+	case tls.RequireAnyClientCert, tls.RequireAndVerifyClientCert:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c clientCertAuthorizer) Authorize(r *http.Request) (Decision, error) {
+	if c.ClientAuth <= tls.RequestClientCert {
+		return DecisionAllow, nil
+	}
+
+	clientCerts := r.TLS.PeerCertificates
+
+	if len(clientCerts) == 0 && isClientCertRequired(c.ClientAuth) {
+		return DecisionDeny, nil
+	}
+
+	if c.ClientAuth >= tls.VerifyClientCertIfGiven && len(clientCerts) > 0 {
+		opts := x509.VerifyOptions{
+			Roots:         c.ClientCAs,
+			CurrentTime:   time.Now(), // FIXME?
+			Intermediates: x509.NewCertPool(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}
+
+		for _, cert := range clientCerts[1:] {
+			opts.Intermediates.AddCert(cert)
+		}
+
+		_, err := clientCerts[0].Verify(opts)
+		if err != nil {
+			return DecisionDeny, nil
+		}
+
+		// TODO
+		// verifiedChains := chains
+	}
+
+	return DecisionAllow, nil
+}
+
+func NewClientCertAuthorizer(clientAuth tls.ClientAuthType, clientCAs *x509.CertPool) (Authorizer, error) {
+	return &clientCertAuthorizer{ClientAuth: clientAuth, ClientCAs: clientCAs}, nil
+}
+
+func NewPathAuthorizer(excludedPaths []string) (Authorizer, error) {
+	excludedPathSet := make(map[string]bool, 0)
+
+	// TODO: add wildcards
+	for _, p := range excludedPaths {
+		excludedPathSet[p] = true
+	}
+
+	return AuthorizerFunc(func(r *http.Request) (Decision, error) {
+		path := r.URL.Path
+
+		if excludedPathSet[path] {
+			return DecisionAllow, nil
+		}
+
+		return DecisionNoDecision, nil
+	}), nil
+}
+
+// ---
 
 // ListenAndServe starts the server on addresses given in WebListenAddresses in
 // the FlagConfig or instead uses systemd socket activated listeners if
@@ -308,16 +511,34 @@ func Serve(l net.Listener, server *http.Server, flags *FlagConfig, logger log.Lo
 		}
 		// Valid TLS config.
 		level.Info(logger).Log("msg", "TLS is enabled.", "http2", c.HTTPConfig.HTTP2, "address", l.Addr().String())
+
+		clientAuth, err := ParseClientAuth(c.TLSConfig.ClientAuth)
+		if err != nil {
+			return err
+		}
+
+		tlsAuthorizationOptions := &TLSAuthorizationOptions{
+			ExcludedPaths: c.AuthorizationExcludedPaths,
+			ClientAuth:    clientAuth,
+			ClientCAs:     config.ClientCAs,
+		}
+
+		authorizer, err := tlsAuthorizationOptions.ToAuthorizer()
+		if err != nil {
+			return err
+		}
+
+		server.Handler = WithAuthorization(server.Handler, authorizer)
+		server.TLSConfig = config
 	case errNoTLSConfig:
 		// No TLS config, back to plain HTTP.
 		level.Info(logger).Log("msg", "TLS is disabled.", "http2", false, "address", l.Addr().String())
+
 		return server.Serve(l)
 	default:
 		// Invalid TLS config.
 		return err
 	}
-
-	server.TLSConfig = config
 
 	// Set the GetConfigForClient method of the HTTPS server so that the config
 	// and certs are reloaded on new connections.
