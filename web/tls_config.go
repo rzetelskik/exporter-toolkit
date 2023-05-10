@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/exporter-toolkit/web/authentication"
 	basicauth_authentication "github.com/prometheus/exporter-toolkit/web/authentication/basicauth"
 	chain_authentication "github.com/prometheus/exporter-toolkit/web/authentication/chain"
+	x509_authentication "github.com/prometheus/exporter-toolkit/web/authentication/x509"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 )
@@ -136,9 +137,46 @@ func getTLSConfig(configPath string) (*tls.Config, error) {
 	return ConfigToTLSConfig(&c.TLSConfig)
 }
 
+func GetClientCAs(clientCAsPath string) (*x509.CertPool, error) {
+	clientCAPool := x509.NewCertPool()
+	if clientCAsPath == "" {
+		return clientCAPool, nil
+	}
+
+	clientCAFile, err := os.ReadFile(clientCAsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCAPool.AppendCertsFromPEM(clientCAFile)
+
+	return clientCAPool, nil
+}
+
+func ParseClientAuth(s string) (tls.ClientAuthType, error) {
+	switch s {
+	case "RequestClientCert":
+		return tls.RequestClientCert, nil
+	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
+		return tls.RequireAnyClientCert, nil
+	case "VerifyClientCertIfGiven":
+		return tls.VerifyClientCertIfGiven, nil
+	case "RequireAndVerifyClientCert":
+		return tls.RequireAndVerifyClientCert, nil
+	case "", "NoClientCert":
+		return tls.NoClientCert, nil
+	default:
+		return tls.ClientAuthType(0), errors.New("Invalid ClientAuth: " + s)
+	}
+}
+
+func isTLSEnabled(c *TLSConfig) bool {
+	return c.TLSCertPath != "" || c.TLSKeyPath != "" || c.ClientAuth != "" || c.ClientCAs != ""
+}
+
 // ConfigToTLSConfig generates the golang tls.Config from the TLSConfig struct.
 func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
-	if c.TLSCertPath == "" && c.TLSKeyPath == "" && c.ClientAuth == "" && c.ClientCAs == "" {
+	if !isTLSEnabled(c) {
 		return nil, errNoTLSConfig
 	}
 
@@ -189,38 +227,26 @@ func ConfigToTLSConfig(c *TLSConfig) (*tls.Config, error) {
 		cfg.CurvePreferences = cp
 	}
 
-	if c.ClientCAs != "" {
-		clientCAPool := x509.NewCertPool()
-		clientCAFile, err := os.ReadFile(c.ClientCAs)
-		if err != nil {
-			return nil, err
-		}
-		clientCAPool.AppendCertsFromPEM(clientCAFile)
-		cfg.ClientCAs = clientCAPool
+	clientCAs, err := GetClientCAs(c.ClientCAs)
+	if err != nil {
+		return nil, err
 	}
+	cfg.ClientCAs = clientCAs
 
-	if c.ClientAllowedSans != nil {
-		// verify that the client cert contains an allowed SAN
-		cfg.VerifyPeerCertificate = c.VerifyPeerCertificate
+	clientAuth, err := ParseClientAuth(c.ClientAuth)
+	if err != nil {
+		return nil, err
 	}
+	cfg.ClientAuth = clientAuth
 
-	switch c.ClientAuth {
-	case "RequestClientCert":
-		cfg.ClientAuth = tls.RequestClientCert
-	case "RequireAnyClientCert", "RequireClientCert": // Preserved for backwards compatibility.
-		cfg.ClientAuth = tls.RequireAnyClientCert
-	case "VerifyClientCertIfGiven":
-		cfg.ClientAuth = tls.VerifyClientCertIfGiven
-	case "RequireAndVerifyClientCert":
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
-	case "", "NoClientCert":
-		cfg.ClientAuth = tls.NoClientCert
-	default:
-		return nil, errors.New("Invalid ClientAuth: " + c.ClientAuth)
-	}
-
-	if c.ClientCAs != "" && cfg.ClientAuth == tls.NoClientCert {
+	if c.ClientCAs != "" && clientAuth == tls.NoClientCert {
 		return nil, errors.New("Client CA's have been configured without a Client Auth Policy")
+	}
+
+	switch clientAuth {
+	case tls.RequireAnyClientCert, tls.VerifyClientCertIfGiven, tls.RequireAndVerifyClientCert:
+		// Cert verification is delegated to the authentication middleware.
+		cfg.ClientAuth = tls.RequestClientCert
 	}
 
 	return cfg, nil
@@ -272,6 +298,24 @@ func ListenAndServe(server *http.Server, flags *FlagConfig, logger log.Logger) e
 	return ServeMultiple(listeners, server, flags, logger)
 }
 
+func isClientCertRequired(c tls.ClientAuthType) bool {
+	switch c {
+	case tls.RequireAnyClientCert, tls.RequireAndVerifyClientCert:
+		return true
+	}
+
+	return false
+}
+
+func isClientCertVerificationRequired(c tls.ClientAuthType) bool {
+	switch c {
+	case tls.VerifyClientCertIfGiven, tls.RequireAndVerifyClientCert:
+		return true
+	}
+
+	return false
+}
+
 func withRequestAuthentication(handler http.Handler, webConfigPath string, logger log.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := getConfig(webConfigPath)
@@ -282,6 +326,45 @@ func withRequestAuthentication(handler http.Handler, webConfigPath string, logge
 		}
 
 		authenticators := make([]authentication.Authenticator, 0)
+
+		if isTLSEnabled(&c.TLSConfig) {
+			clientAuth, err := ParseClientAuth(c.TLSConfig.ClientAuth)
+			if err != nil {
+				level.Error(logger).Log("msg", "Error parsing ClientAuth", "err", err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+
+			if clientAuth != tls.NoClientCert {
+				requireClientCertsFn := func() bool {
+					return isClientCertRequired(clientAuth)
+				}
+
+				var verifyOptionsFn func() x509.VerifyOptions
+				if isClientCertVerificationRequired(clientAuth) {
+					clientCAs, err := GetClientCAs(c.TLSConfig.ClientCAs)
+					if err != nil {
+						level.Error(logger).Log("msg", "Error getting ClientCAs", "err", err)
+						http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+						return
+					}
+
+					verifyOptionsFn = func() x509.VerifyOptions {
+						opts := x509_authentication.DefaultVerifyOptions()
+						opts.Roots = clientCAs
+						return opts
+					}
+				}
+
+				var verifyPeerCertificateFn func([][]byte, [][]*x509.Certificate) error
+				if len(c.TLSConfig.ClientAllowedSans) > 0 {
+					verifyPeerCertificateFn = c.TLSConfig.VerifyPeerCertificate
+				}
+
+				x509Authenticator := x509_authentication.NewX509Authenticator(requireClientCertsFn, verifyOptionsFn, verifyPeerCertificateFn)
+				authenticators = append(authenticators, x509Authenticator)
+			}
+		}
 
 		if len(c.Users) > 0 {
 			basicAuthAuthenticator := basicauth_authentication.NewBasicAuthAuthenticator(c.Users)
